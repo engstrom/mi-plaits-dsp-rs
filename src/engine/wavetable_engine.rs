@@ -21,6 +21,8 @@
 
 // Based on MIT-licensed code (c) 2016 by Emilie Gillet (emilie.o.gillet@gmail.com)
 
+use alloc::boxed::Box;
+
 use super::{note_to_frequency, Engine, EngineParameters};
 use crate::oscillator::wavetable_oscillator::{interpolate_wave_hermite, Differentiator};
 use crate::resources::waves::WAV_INTEGRATED_WAVES;
@@ -29,6 +31,11 @@ use crate::utils::parameter_interpolator::SimpleParameterInterpolator;
 
 const TABLE_SIZE: usize = 128;
 const TABLE_SIZE_F: f32 = TABLE_SIZE as f32;
+
+/// #306 user-bank pool size: 4 independent banks × 64 waves × (`TABLE_SIZE` + 4
+/// Hermite guard) i16. The stock 192-wave pool only has 3 independent banks
+/// (bank D is a permutation), so a distinct 4-bank BLEND needs its own pool.
+const USER_POOL_LEN: usize = 4 * 64 * (TABLE_SIZE + 4);
 
 #[derive(Debug, Clone)]
 pub struct WavetableEngine<'a> {
@@ -50,6 +57,11 @@ pub struct WavetableEngine<'a> {
     diff_out: Differentiator,
 
     wavetables: &'a [i16; 25344],
+
+    // #306: optional owned four-bank user pool. `Some` → `read_wave` reads four
+    // independent 64-wave banks from here (no permutation, no ROM `% 192`) so
+    // BLEND (HARMONICS/z) crossfades four DISTINCT user tables. `None` → stock.
+    user_pool: Option<Box<[i16; USER_POOL_LEN]>>,
 }
 
 impl Default for WavetableEngine<'_> {
@@ -79,11 +91,25 @@ impl<'a> WavetableEngine<'a> {
             diff_out: Differentiator::new(),
 
             wavetables: &WAV_INTEGRATED_WAVES,
+
+            user_pool: None,
         }
     }
 
     pub fn set_wavetables(&mut self, wavetables: &'a [i16; 25344]) {
         self.wavetables = wavetables;
+    }
+
+    /// #306: load four independent user banks. `pool` is `[bank * 64 + cell]`,
+    /// each entry a `TABLE_SIZE + 4` i16 wave (the caller pre-resolves any ROM /
+    /// custom wave-map into flat data). While set, HARMONICS crossfades the four
+    /// banks; `clear_user_banks` reverts to the stock pool.
+    pub fn set_user_banks(&mut self, pool: Box<[i16; USER_POOL_LEN]>) {
+        self.user_pool = Some(pool);
+    }
+
+    pub fn clear_user_banks(&mut self) {
+        self.user_pool = None;
     }
 
     #[inline]
@@ -96,9 +122,15 @@ impl<'a> WavetableEngine<'a> {
         phase_integral: usize,
         phase_fractional: f32,
     ) -> f32 {
-        let wave = ((x + y * 8 + z * 64) * randomize) % 192;
+        let (table, wave): (&[i16], usize) = match self.user_pool {
+            // Four independent banks: `z` (already folded to 0..=3 by the
+            // caller) selects the bank directly — no `randomize` / `% 192`
+            // permutation, so each bank is its own distinct table.
+            Some(ref pool) => (&pool[..], z * 64 + x + y * 8),
+            None => (&self.wavetables[..], ((x + y * 8 + z * 64) * randomize) % 192),
+        };
         interpolate_wave_hermite(
-            &self.wavetables[wave * (TABLE_SIZE + 4)..],
+            &table[wave * (TABLE_SIZE + 4)..],
             phase_integral,
             phase_fractional,
         )
