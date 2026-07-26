@@ -22,6 +22,7 @@
 // Based on MIT-licensed code (c) 2016 by Emilie Gillet (emilie.o.gillet@gmail.com)
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use super::{note_to_frequency, Engine, EngineParameters};
 use crate::oscillator::wavetable_oscillator::{interpolate_wave_hermite, Differentiator};
@@ -35,7 +36,7 @@ const TABLE_SIZE_F: f32 = TABLE_SIZE as f32;
 /// #306 user-bank pool size: 4 independent banks × 64 waves × (`TABLE_SIZE` + 4
 /// Hermite guard) i16. The stock 192-wave pool only has 3 independent banks
 /// (bank D is a permutation), so a distinct 4-bank BLEND needs its own pool.
-const USER_POOL_LEN: usize = 4 * 64 * (TABLE_SIZE + 4);
+pub const USER_POOL_LEN: usize = 4 * 64 * (TABLE_SIZE + 4);
 
 #[derive(Debug, Clone)]
 pub struct WavetableEngine<'a> {
@@ -58,10 +59,12 @@ pub struct WavetableEngine<'a> {
 
     wavetables: &'a [i16; 25344],
 
-    // #306: optional owned four-bank user pool. `Some` → `read_wave` reads four
+    // #306: optional shared four-bank user pool. `Some` → `read_wave` reads four
     // independent 64-wave banks from here (no permutation, no ROM `% 192`) so
     // BLEND (HARMONICS/z) crossfades four DISTINCT user tables. `None` → stock.
-    user_pool: Option<Box<[i16; USER_POOL_LEN]>>,
+    // Held behind an `Arc` so a caller that prebuilds the pool off the audio
+    // thread can install it with a refcount move instead of copying it.
+    user_pool: Option<Arc<[i16; USER_POOL_LEN]>>,
 }
 
 impl Default for WavetableEngine<'_> {
@@ -104,7 +107,20 @@ impl<'a> WavetableEngine<'a> {
     /// each entry a `TABLE_SIZE + 4` i16 wave (the caller pre-resolves any ROM /
     /// custom wave-map into flat data). While set, HARMONICS crossfades the four
     /// banks; `clear_user_banks` reverts to the stock pool.
+    ///
+    /// Converting the `Box` into the shared representation allocates once. Callers
+    /// on a real-time thread should prebuild an [`Arc`] elsewhere and install it
+    /// with [`WavetableEngine::set_user_banks_shared`] instead.
     pub fn set_user_banks(&mut self, pool: Box<[i16; USER_POOL_LEN]>) {
+        self.user_pool = Some(Arc::from(pool));
+    }
+
+    /// Same as [`WavetableEngine::set_user_banks`], but takes an already shared
+    /// pool and stores it as-is: no allocation, no copy of the wave data, just a
+    /// refcount move. This makes bank swaps safe to perform on an audio thread
+    /// when the pool was built ahead of time, and lets several engines play from
+    /// one pool (it is only ever read).
+    pub fn set_user_banks_shared(&mut self, pool: Arc<[i16; USER_POOL_LEN]>) {
         self.user_pool = Some(pool);
     }
 
@@ -127,7 +143,10 @@ impl<'a> WavetableEngine<'a> {
             // caller) selects the bank directly — no `randomize` / `% 192`
             // permutation, so each bank is its own distinct table.
             Some(ref pool) => (&pool[..], z * 64 + x + y * 8),
-            None => (&self.wavetables[..], ((x + y * 8 + z * 64) * randomize) % 192),
+            None => (
+                &self.wavetables[..],
+                ((x + y * 8 + z * 64) * randomize) % 192,
+            ),
         };
         interpolate_wave_hermite(
             &table[wave * (TABLE_SIZE + 4)..],
