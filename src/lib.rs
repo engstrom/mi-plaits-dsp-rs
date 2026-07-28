@@ -13,6 +13,7 @@ pub mod fm;
 pub mod fx;
 pub mod noise;
 pub mod oscillator;
+pub mod performance;
 pub mod physical_modelling;
 pub mod resources;
 pub mod speech;

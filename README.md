@@ -23,6 +23,41 @@ The major motivation behind this port is:
 
 The APIs used in this crate are kept close to the original ones intentionally, resulting in a number of clippy warnings that have been suppressed.
 
+## Performance effects
+
+Besides the port itself, the crate contains a `performance` module with a set of
+tempo synced effects meant to be played live like the FX pads of a sampler such as
+[Koala](https://www.koalasampler.com/). It is original code, not part of the Plaits
+firmware.
+
+Effects are arranged in a chain of slots and are *engaged* while a pad is held down.
+The chain crossfades between the dry signal and the effect output on every press and
+release, and it keeps feeding the effects while they are bypassed so that the buffer
+based ones always have recent audio to work with.
+
+Included so far: beat repeat, reverse, tape stop, gate, filter sweep, bit crusher and
+a tempo synced delay.
+
+```rust
+use mi_plaits_dsp::performance::{Division, EffectKind, PerformanceFx};
+
+let mut fx = PerformanceFx::new();
+fx.init(48000.0);
+fx.set_tempo(120.0);
+
+let repeat = fx.add_kind(EffectKind::BeatRepeat);
+fx.set_division(repeat, Division::Sixteenth);
+
+let mut block = [0.0; 24];
+fx.engage(repeat);
+fx.process(&mut block);
+fx.release(repeat);
+```
+
+Effects render at unity gain and do not limit their output, so a resonant filter
+sweep or a delay with high feedback can exceed the `-1.0` to `1.0` range. Use
+[`utils::limiter::Limiter`] on the result if that matters for the application.
+
 ## Tests
 
 Run `cargo test` to run a number of integration tests that produce `WAV` files in the `./out` directory.
