@@ -3,6 +3,11 @@
 
 extern crate alloc;
 
+// `std` is linked only for the thread-local PRNG state (see `utils::random`). Everything else
+// in the crate stays `no_std`; turning the feature off restores upstream's global atomic.
+#[cfg(feature = "std")]
+extern crate std;
+
 pub mod chords;
 pub mod downsampler;
 pub mod drums;
