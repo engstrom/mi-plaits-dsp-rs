@@ -1,4 +1,12 @@
 //! Resonator, taken from Rings' code but with fixed position.
+//!
+//! Grout change (engstrom/grout#1039): `Resonator::process` computes every mode's coefficients
+//! first and then renders the batches of modes three to a per-sample loop
+//! (`process_bandpass_group`), where the original rendered one batch at a time, each its own
+//! pass over the block. Each mode's recurrence waits on its last sample, so one batch at a time
+//! leaves the core waiting on a dependency chain; three in one loop let it overlap them. The
+//! float operations and their order are the original's — each batch's sum from `0.0` in mode
+//! order, then the batches' sums added to `out` in batch order — so not one sample changes.
 
 // Based on MIT-licensed code (c) 2016 by Emilie Gillet (emilie.o.gillet@gmail.com)
 
@@ -61,14 +69,13 @@ impl Resonator {
         brightness *= 1.0 - damping * 0.3;
         let q_loss = brightness * (2.0 - brightness) * 0.85 + 0.15;
 
-        let mut mode_q: [f32; MODE_BATCH_SIZE] = [0.0; MODE_BATCH_SIZE];
-        let mut mode_f: [f32; MODE_BATCH_SIZE] = [0.0; MODE_BATCH_SIZE];
-        let mut mode_a: [f32; MODE_BATCH_SIZE] = [0.0; MODE_BATCH_SIZE];
-        let mut batch_counter = 0;
+        let mut mode_q = [[0.0; MODE_BATCH_SIZE]; MODE_FILTERS_LENGTH];
+        let mut mode_f = [[0.0; MODE_BATCH_SIZE]; MODE_FILTERS_LENGTH];
+        let mut mode_a = [[0.0; MODE_BATCH_SIZE]; MODE_FILTERS_LENGTH];
 
-        let mut batch_processor_index = 0;
-        let mut batch_processor = &mut self.mode_filters[0];
-
+        // Every mode's frequency, Q and gain first, in the order and arithmetic the per-batch
+        // version used (none of it reads a filter's state). A mode past the last whole batch is
+        // computed and dropped, as it was.
         for i in 0..self.resolution {
             let mut mode_frequency = harmonic * stretch_factor;
             if mode_frequency >= 0.499 {
@@ -76,27 +83,10 @@ impl Resonator {
             }
             let mode_attenuation = 1.0 - mode_frequency * 2.0;
 
-            mode_f[batch_counter] = mode_frequency;
-            mode_q[batch_counter] = 1.0 + mode_frequency * q;
-            mode_a[batch_counter] = self.mode_amplitude[i] * mode_attenuation;
-            batch_counter += 1;
-
-            if batch_counter == MODE_BATCH_SIZE {
-                batch_counter = 0;
-                batch_processor.process(
-                    &mode_f,
-                    &mode_q,
-                    &mode_a,
-                    in_,
-                    out,
-                    FilterMode::BandPass,
-                    true,
-                );
-                batch_processor_index += 1;
-                if batch_processor_index < MAX_NUM_MODES / MODE_BATCH_SIZE {
-                    batch_processor = &mut self.mode_filters[batch_processor_index];
-                }
-            }
+            let (batch, slot) = (i / MODE_BATCH_SIZE, i % MODE_BATCH_SIZE);
+            mode_f[batch][slot] = mode_frequency;
+            mode_q[batch][slot] = 1.0 + mode_frequency * q;
+            mode_a[batch][slot] = self.mode_amplitude[i] * mode_attenuation;
 
             stretch_factor += stiffness;
 
@@ -113,6 +103,98 @@ impl Resonator {
             harmonic += f0;
             q *= q_loss;
         }
+
+        // Then the batches, `MODES_GROUP` to a per-sample loop (Grout #1039).
+        let batches = self.resolution / MODE_BATCH_SIZE;
+        let mut b = 0;
+        while b + MODES_GROUP <= batches {
+            process_bandpass_group::<MODES_GROUP>(
+                &mut self.mode_filters[b..b + MODES_GROUP],
+                &mode_f[b..b + MODES_GROUP],
+                &mode_q[b..b + MODES_GROUP],
+                &mode_a[b..b + MODES_GROUP],
+                in_,
+                out,
+            );
+            b += MODES_GROUP;
+        }
+        while b < batches {
+            process_bandpass_group::<1>(
+                &mut self.mode_filters[b..b + 1],
+                &mode_f[b..b + 1],
+                &mode_q[b..b + 1],
+                &mode_a[b..b + 1],
+                in_,
+                out,
+            );
+            b += 1;
+        }
+    }
+}
+
+/// How many batches of modes share one per-sample loop. Three was the fastest on the desktop
+/// that measured it (#1039); six spilled there.
+const MODES_GROUP: usize = 3;
+
+/// `N` batches of modes as band-passes added to `out`: the same samples as `N` calls of
+/// `ResonatorSvf::process(.., FilterMode::BandPass, true)` one after another. Each batch keeps
+/// its own chain of operations and its own `s_out`, summed from `0.0` in mode order, and each
+/// output sample takes the batches' sums in batch order — the order the separate calls added
+/// them — so every float operation is the one it was. What changes is only the schedule: the
+/// batches' recurrences are independent, so in one loop the core overlaps them instead of
+/// waiting out each one's dependency chain in turn, and the state is stored once a call rather
+/// than once a sample.
+#[inline]
+fn process_bandpass_group<const N: usize>(
+    filters: &mut [ResonatorSvf<MODE_BATCH_SIZE>],
+    f: &[[f32; MODE_BATCH_SIZE]],
+    q: &[[f32; MODE_BATCH_SIZE]],
+    gain: &[[f32; MODE_BATCH_SIZE]],
+    in_: &[f32],
+    out: &mut [f32],
+) {
+    let mut g = [[0.0f32; MODE_BATCH_SIZE]; N];
+    let mut r_plus_g = [[0.0f32; MODE_BATCH_SIZE]; N];
+    let mut h = [[0.0f32; MODE_BATCH_SIZE]; N];
+    let mut state_1 = [[0.0f32; MODE_BATCH_SIZE]; N];
+    let mut state_2 = [[0.0f32; MODE_BATCH_SIZE]; N];
+    let mut gains = [[0.0f32; MODE_BATCH_SIZE]; N];
+
+    for n in 0..N {
+        for i in 0..MODE_BATCH_SIZE {
+            g[n][i] = OnePole::tan(f[n][i], FrequencyApproximation::Fast);
+            let r = 1.0 / q[n][i];
+            h[n][i] = 1.0 / (1.0 + r * g[n][i] + g[n][i] * g[n][i]);
+            r_plus_g[n][i] = r + g[n][i];
+            state_1[n][i] = filters[n].state_1[i];
+            state_2[n][i] = filters[n].state_2[i];
+            gains[n][i] = gain[n][i];
+        }
+    }
+
+    for (in_sample, out_sample) in in_.iter().zip(out.iter_mut()) {
+        let s_in = *in_sample;
+        let mut s_out = [0.0f32; N];
+
+        for n in 0..N {
+            for i in 0..MODE_BATCH_SIZE {
+                let hp = (s_in - r_plus_g[n][i] * state_1[n][i] - state_2[n][i]) * h[n][i];
+                let bp = g[n][i] * hp + state_1[n][i];
+                state_1[n][i] = g[n][i] * hp + bp;
+                let lp = g[n][i] * bp + state_2[n][i];
+                state_2[n][i] = g[n][i] * bp + lp;
+                s_out[n] += gains[n][i] * bp;
+            }
+        }
+
+        for s in s_out {
+            *out_sample += s;
+        }
+    }
+
+    for n in 0..N {
+        filters[n].state_1 = state_1[n];
+        filters[n].state_2 = state_2[n];
     }
 }
 
