@@ -85,6 +85,13 @@ impl String {
         self.src_phase = 0.0;
     }
 
+    /// The last two output samples are zero, so with `f0` 0 (`src_ratio` 0, the per-sample loop
+    /// never running) `process` adds exactly zero to `out`. See `StringVoice::render`.
+    #[inline]
+    pub fn is_at_rest(&self) -> bool {
+        self.out_sample[0] == 0.0 && self.out_sample[1] == 0.0
+    }
+
     #[inline]
     pub fn process(
         &mut self,

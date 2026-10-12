@@ -162,6 +162,12 @@ impl Svf {
         self.state_2 = 0.0;
     }
 
+    /// Both states are zero (of either sign): a zero input then gives a zero output.
+    #[inline]
+    pub fn is_at_rest(&self) -> bool {
+        self.state_1 == 0.0 && self.state_2 == 0.0
+    }
+
     /// Copy settings from another filter.
     #[inline]
     pub fn set(&mut self, f: &Self) {

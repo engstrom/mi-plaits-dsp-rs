@@ -1,4 +1,17 @@
 //! Extended Karplus-Strong, with all the niceties from Rings.
+//!
+//! Grout change (engstrom/grout#1039): `render` returns early, touching nothing, for a string
+//! that is neither excited nor tuned and holds no sound — not triggered, not sustained, no noise
+//! burst left, `f0` exactly 0, its exciter filter's state and its last two output samples all
+//! zero. Such a string renders exactly zero: its exciter filter turns zero into zero, and with
+//! `f0` 0 the string's `src_ratio` is 0, so its per-sample loop never runs, nothing is drawn from
+//! the PRNG, and `out` takes `crossfade(0, 0, src_phase)`. `out` and `aux` are only ever
+//! accumulated into from a `+0.0` fill, so they never hold `-0.0`, and adding a zero of either
+//! sign to them changes no bit. What the skip leaves undone is the sign of a zero in the exciter
+//! filter's state and the string's damping filter's coefficients, which the next render that
+//! uses them sets first: neither can reach a non-zero sample. `StringEngine::init` puts its
+//! rotation where a rising edge excites string 0 and leaves strings 1 and 2 at `f0` 0, so a host
+//! that re-initialises the engine at every note, as Grout does, renders one string of three.
 
 // Based on MIT-licensed code (c) 2016 by Emilie Gillet (emilie.o.gillet@gmail.com)
 
@@ -56,6 +69,16 @@ impl StringVoice {
         out: &mut [f32],
         aux: &mut [f32],
     ) {
+        if !trigger
+            && !sustain
+            && f0 == 0.0
+            && self.remaining_noise_samples == 0
+            && self.excitation_filter.is_at_rest()
+            && self.string.is_at_rest()
+        {
+            return;
+        }
+
         let density = brightness * brightness;
 
         brightness += 0.25 * accent * (1.0 - brightness);
