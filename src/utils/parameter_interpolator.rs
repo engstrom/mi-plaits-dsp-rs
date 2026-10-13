@@ -1,4 +1,7 @@
 //! Linear interpolation of parameters in rendering loops.
+//!
+//! Grout change (engstrom/grout#166): `ParameterInterpolator::detach` and
+//! `DetachedInterpolator`, the same interpolation for a caller that keeps the state itself.
 
 // Based on MIT-licensed code (c) 2015 by Olivier Gillet (ol.gillet@gmail.com)
 
@@ -46,6 +49,42 @@ impl<'a> ParameterInterpolator<'a> {
     #[inline]
     pub fn subsample(&self, t: f32) -> f32 {
         self.value + self.increment * t
+    }
+}
+
+impl ParameterInterpolator<'_> {
+    /// The interpolation without the borrow of its state: the same value and increment, for a
+    /// caller that writes the value back itself ([`DetachedInterpolator::value`]) rather than on
+    /// drop. Writes the state back now, unchanged, as a drop before any `next` would.
+    #[inline]
+    pub fn detach(self) -> DetachedInterpolator {
+        DetachedInterpolator {
+            value: self.value,
+            increment: self.increment,
+        }
+    }
+}
+
+/// A [`ParameterInterpolator`] whose state the caller keeps (Grout #166): `next` is the same
+/// arithmetic, and the caller stores [`Self::value`] where the interpolator's drop would have.
+#[derive(Debug, Clone, Copy)]
+pub struct DetachedInterpolator {
+    value: f32,
+    increment: f32,
+}
+
+impl DetachedInterpolator {
+    #[inline]
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> f32 {
+        self.value += self.increment;
+        self.value
+    }
+
+    /// The value the interpolation has reached: what [`ParameterInterpolator`]'s drop stores.
+    #[inline]
+    pub fn value(&self) -> f32 {
+        self.value
     }
 }
 

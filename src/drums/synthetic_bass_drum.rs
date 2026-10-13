@@ -1,5 +1,9 @@
 //! Naive bass drum model (modulated oscillator with FM + envelope).
 //! Inadvertently 909-ish.
+//!
+//! Grout change (engstrom/grout#166): `SyntheticBassDrum::render`'s loop body is `step`, what
+//! comes before it `begin` and what after it `end`, as in `analog_bass_drum`; `render` is those
+//! three, and the same arithmetic in the same order as before.
 
 // Based on MIT-licensed code (c) 2016 by Emilie Gillet (emilie.o.gillet@gmail.com)
 
@@ -8,7 +12,7 @@ use num_traits::float::Float;
 
 use crate::oscillator::sine_oscillator::sine;
 use crate::utils::filter::{FilterMode, FrequencyApproximation, Svf};
-use crate::utils::parameter_interpolator::ParameterInterpolator;
+use crate::utils::parameter_interpolator::{DetachedInterpolator, ParameterInterpolator};
 use crate::utils::random;
 use crate::utils::units::semitones_to_ratio;
 use crate::utils::{one_pole, slope};
@@ -70,16 +74,53 @@ impl SyntheticBassDrum {
         accent: f32,
         f0: f32,
         tone: f32,
+        decay: f32,
+        dirtiness: f32,
+        fm_envelope_amount: f32,
+        fm_envelope_decay: f32,
+        out: &mut [f32],
+    ) {
+        let mut block = self.begin(
+            sustain,
+            trigger,
+            accent,
+            f0,
+            tone,
+            decay,
+            dirtiness,
+            fm_envelope_amount,
+            fm_envelope_decay,
+            out.len(),
+        );
+        for out_sample in out.iter_mut() {
+            *out_sample = self.step(&mut block);
+        }
+        self.end(&block);
+    }
+
+    /// [`Self::render`] before its loop: the trigger, and what every sample of the block reads.
+    /// [`Self::step`] is one sample of the loop and [`Self::end`] what follows it, so a caller can
+    /// run another model's samples beside this one's (Grout #166) and get the samples `render`
+    /// writes.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn begin(
+        &mut self,
+        sustain: bool,
+        trigger: bool,
+        accent: f32,
+        f0: f32,
+        tone: f32,
         mut decay: f32,
         mut dirtiness: f32,
         fm_envelope_amount: f32,
         mut fm_envelope_decay: f32,
-        out: &mut [f32],
-    ) {
+        size: usize,
+    ) -> SyntheticBassDrumBlock {
         decay *= decay;
         fm_envelope_decay *= fm_envelope_decay;
 
-        let mut f0_mod = ParameterInterpolator::new(&mut self.f0, f0, out.len());
+        let f0_mod = ParameterInterpolator::new(&mut self.f0, f0, size).detach();
 
         dirtiness *= f32::max(1.0 - 8.0 * f0, 0.0);
 
@@ -99,64 +140,87 @@ impl SyntheticBassDrum {
             self.fm_pulse_width = (self.sample_rate_hz * 0.0013) as i32;
         }
 
-        let mut sustain_gain =
-            ParameterInterpolator::new(&mut self.sustain_gain, accent * decay, out.len());
+        let sustain_gain =
+            ParameterInterpolator::new(&mut self.sustain_gain, accent * decay, size).detach();
 
-        for out_sample in out.iter_mut() {
-            one_pole(&mut self.phase_noise, random::get_float() - 0.5, 0.002);
+        SyntheticBassDrumBlock {
+            sustain,
+            dirtiness,
+            fm_envelope_amount,
+            fm_decay,
+            body_env_decay,
+            transient_env_decay,
+            tone_f,
+            transient_level,
+            f0_mod,
+            sustain_gain,
+        }
+    }
 
-            let mut mix = 0.0;
+    /// One sample of [`Self::render`]'s loop.
+    #[inline(always)]
+    pub(crate) fn step(&mut self, b: &mut SyntheticBassDrumBlock) -> f32 {
+        let dirtiness = b.dirtiness;
+        one_pole(&mut self.phase_noise, random::get_float() - 0.5, 0.002);
 
-            if sustain {
-                self.phase += f0_mod.next();
+        let mut mix = 0.0;
+
+        if b.sustain {
+            self.phase += b.f0_mod.next();
+            if self.phase >= 1.0 {
+                self.phase -= 1.0;
+            }
+            let body = Self::distorted_sine(self.phase, self.phase_noise, dirtiness);
+            mix -= Self::transistor_vca(body, b.sustain_gain.next());
+        } else {
+            if self.fm_pulse_width != 0 {
+                self.fm_pulse_width -= 1;
+                self.phase = 0.25;
+            } else {
+                self.fm *= b.fm_decay;
+                let fm = 1.0 + b.fm_envelope_amount * 3.5 * self.fm_lp;
+                self.phase += f32::min(b.f0_mod.next() * fm, 0.5);
                 if self.phase >= 1.0 {
                     self.phase -= 1.0;
                 }
-                let body = Self::distorted_sine(self.phase, self.phase_noise, dirtiness);
-                mix -= Self::transistor_vca(body, sustain_gain.next());
-            } else {
-                if self.fm_pulse_width != 0 {
-                    self.fm_pulse_width -= 1;
-                    self.phase = 0.25;
-                } else {
-                    self.fm *= fm_decay;
-                    let fm = 1.0 + fm_envelope_amount * 3.5 * self.fm_lp;
-                    self.phase += f32::min(f0_mod.next() * fm, 0.5);
-                    if self.phase >= 1.0 {
-                        self.phase -= 1.0;
-                    }
-                }
-
-                if self.body_env_pulse_width != 0 {
-                    self.body_env_pulse_width -= 1;
-                } else {
-                    self.body_env *= body_env_decay;
-                    self.transient_env *= transient_env_decay;
-                }
-
-                let envelope_lp_f = 0.1;
-                one_pole(&mut self.body_env_lp, self.body_env, envelope_lp_f);
-                one_pole(
-                    &mut self.transient_env_lp,
-                    self.transient_env,
-                    envelope_lp_f,
-                );
-                one_pole(&mut self.fm_lp, self.fm, envelope_lp_f);
-
-                let body = Self::distorted_sine(self.phase, self.phase_noise, dirtiness);
-                let transient = self.click.process(if self.body_env_pulse_width != 0 {
-                    0.0
-                } else {
-                    1.0
-                }) + self.noise.render();
-
-                mix -= Self::transistor_vca(body, self.body_env_lp);
-                mix -= transient * self.transient_env_lp * transient_level;
             }
 
-            one_pole(&mut self.tone_lp, mix, tone_f);
-            *out_sample = self.tone_lp;
+            if self.body_env_pulse_width != 0 {
+                self.body_env_pulse_width -= 1;
+            } else {
+                self.body_env *= b.body_env_decay;
+                self.transient_env *= b.transient_env_decay;
+            }
+
+            let envelope_lp_f = 0.1;
+            one_pole(&mut self.body_env_lp, self.body_env, envelope_lp_f);
+            one_pole(
+                &mut self.transient_env_lp,
+                self.transient_env,
+                envelope_lp_f,
+            );
+            one_pole(&mut self.fm_lp, self.fm, envelope_lp_f);
+
+            let body = Self::distorted_sine(self.phase, self.phase_noise, dirtiness);
+            let transient = self.click.process(if self.body_env_pulse_width != 0 {
+                0.0
+            } else {
+                1.0
+            }) + self.noise.render();
+
+            mix -= Self::transistor_vca(body, self.body_env_lp);
+            mix -= transient * self.transient_env_lp * b.transient_level;
         }
+
+        one_pole(&mut self.tone_lp, mix, b.tone_f);
+        self.tone_lp
+    }
+
+    /// [`Self::render`] after its loop: the two interpolations are kept.
+    #[inline]
+    pub(crate) fn end(&mut self, b: &SyntheticBassDrumBlock) {
+        self.f0 = b.f0_mod.value();
+        self.sustain_gain = b.sustain_gain.value();
     }
 
     #[inline]
@@ -178,6 +242,21 @@ impl SyntheticBassDrum {
 
         3.0 * s / (2.0 + s.abs()) + gain * 0.3
     }
+}
+
+/// What every sample of one [`SyntheticBassDrum::render`] block reads, and its two
+/// interpolations.
+pub(crate) struct SyntheticBassDrumBlock {
+    sustain: bool,
+    dirtiness: f32,
+    fm_envelope_amount: f32,
+    fm_decay: f32,
+    body_env_decay: f32,
+    transient_env_decay: f32,
+    tone_f: f32,
+    transient_level: f32,
+    f0_mod: DetachedInterpolator,
+    sustain_gain: DetachedInterpolator,
 }
 
 #[derive(Debug, Default, Clone)]
