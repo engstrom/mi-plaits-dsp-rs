@@ -176,6 +176,28 @@ impl Engine for WavetableEngine<'_> {
         self.diff_out.init();
     }
 
+    /// Both smoothing stages land on their fixed point for these knobs: the
+    /// per-call pre-filters on the scaled knobs, and the per-block
+    /// interpolators plus per-sample one-poles on the quantized targets
+    /// `render` would derive from them. Pitch lands too, so a fresh engine
+    /// doesn't chirp up from A0 over its first block. Phase and the
+    /// differentiator are left alone: they're the oscillator, not smoothing.
+    fn settle(&mut self, parameters: &EngineParameters) {
+        self.x_pre_lp = parameters.timbre * 6.9999;
+        self.y_pre_lp = parameters.morph * 6.9999;
+        self.z_pre_lp = parameters.harmonics * 6.9999;
+
+        let (_, [x, y, z]) = quantized_targets([self.x_pre_lp, self.y_pre_lp, self.z_pre_lp]);
+        self.previous_x = x;
+        self.previous_y = y;
+        self.previous_z = z;
+        self.x_lp = x;
+        self.y_lp = y;
+        self.z_lp = z;
+
+        self.previous_f0 = note_to_frequency(parameters.note, parameters.a0_normalized);
+    }
+
     #[inline]
     fn render(
         &mut self,
@@ -190,39 +212,13 @@ impl Engine for WavetableEngine<'_> {
         one_pole(&mut self.y_pre_lp, parameters.morph * 6.9999, 0.2);
         one_pole(&mut self.z_pre_lp, parameters.harmonics * 6.9999, 0.05);
 
-        let x = self.x_pre_lp;
-        let y = self.y_pre_lp;
-        let z = self.z_pre_lp;
-
-        let quantization = (z - 3.0).clamp(0.0, 1.0);
+        let (quantization, [x_target, y_target, z_target]) =
+            quantized_targets([self.x_pre_lp, self.y_pre_lp, self.z_pre_lp]);
         let lp_coefficient = (2.0 * f0 * (4.0 - 3.0 * quantization)).clamp(0.01, 0.1);
 
-        let x_integral = x as usize;
-        let mut x_fractional = x - (x_integral as f32);
-        let y_integral = y as usize;
-        let mut y_fractional = y - (y_integral as f32);
-        let z_integral = z as usize;
-        let mut z_fractional = z - (z_integral as f32);
-
-        x_fractional += quantization * (clamp(x_fractional, 16.0) - x_fractional);
-        y_fractional += quantization * (clamp(y_fractional, 16.0) - y_fractional);
-        z_fractional += quantization * (clamp(z_fractional, 16.0) - z_fractional);
-
-        let x_modulation = SimpleParameterInterpolator::new(
-            self.previous_x,
-            x_integral as f32 + x_fractional,
-            out.len(),
-        );
-        let y_modulation = SimpleParameterInterpolator::new(
-            self.previous_y,
-            y_integral as f32 + y_fractional,
-            out.len(),
-        );
-        let z_modulation = SimpleParameterInterpolator::new(
-            self.previous_z,
-            z_integral as f32 + z_fractional,
-            out.len(),
-        );
+        let x_modulation = SimpleParameterInterpolator::new(self.previous_x, x_target, out.len());
+        let y_modulation = SimpleParameterInterpolator::new(self.previous_y, y_target, out.len());
+        let z_modulation = SimpleParameterInterpolator::new(self.previous_z, z_target, out.len());
 
         let f0_modulation = SimpleParameterInterpolator::new(self.previous_f0, f0, out.len());
 
@@ -315,6 +311,23 @@ impl Engine for WavetableEngine<'_> {
     }
 }
 
+/// The per-sample stage's targets for the pre-filtered (x, y, z): each split
+/// into cell + fraction, with the fraction pushed towards the cell edges as
+/// HARMONICS enters the quantized (non-interpolated) half of its range.
+/// Returns the quantization amount alongside, since the per-sample
+/// coefficient depends on it.
+#[inline]
+fn quantized_targets(pre: [f32; 3]) -> (f32, [f32; 3]) {
+    let quantization = (pre[2] - 3.0).clamp(0.0, 1.0);
+    let targets = pre.map(|v| {
+        let integral = v as usize;
+        let mut fractional = v - (integral as f32);
+        fractional += quantization * (clamp(fractional, 16.0) - fractional);
+        integral as f32 + fractional
+    });
+    (quantization, targets)
+}
+
 #[inline]
 fn clamp(mut x: f32, amount: f32) -> f32 {
     x -= 0.5;
@@ -323,4 +336,83 @@ fn clamp(mut x: f32, amount: f32) -> f32 {
     x += 0.5;
 
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TriggerState;
+
+    const BLOCK: usize = 24;
+
+    fn params(note: f32, timbre: f32, morph: f32, harmonics: f32) -> EngineParameters {
+        EngineParameters {
+            trigger: TriggerState::High,
+            note,
+            timbre,
+            morph,
+            harmonics,
+            accent: 1.0,
+            a0_normalized: 55.0 / 48_000.0,
+        }
+    }
+
+    fn smoothing(e: &WavetableEngine) -> [f32; 10] {
+        [
+            e.x_pre_lp,
+            e.y_pre_lp,
+            e.z_pre_lp,
+            e.previous_x,
+            e.previous_y,
+            e.previous_z,
+            e.x_lp,
+            e.y_lp,
+            e.z_lp,
+            e.previous_f0,
+        ]
+    }
+
+    fn render(e: &mut WavetableEngine, p: &EngineParameters) {
+        let (mut out, mut aux) = ([0.0; BLOCK], [0.0; BLOCK]);
+        e.render(p, &mut out, &mut aux, &mut false);
+    }
+
+    // The interpolated and the quantized half of HARMONICS, and a low note
+    // where the per-sample coefficient sits on its 0.01 floor.
+    const CASES: [(f32, f32, f32, f32); 3] = [
+        (52.0, 0.44, 0.43, 0.31),
+        (28.0, 0.9, 0.1, 0.2),
+        (64.0, 0.25, 0.75, 0.8),
+    ];
+
+    #[test]
+    fn settle_lands_on_a_fixed_point_of_render() {
+        for (note, t, m, h) in CASES {
+            let p = params(note, t, m, h);
+            let mut e = WavetableEngine::new();
+            e.init(48_000.0);
+            e.settle(&p);
+            let settled = smoothing(&e);
+            render(&mut e, &p);
+            assert_eq!(smoothing(&e), settled, "one render moved a settled engine");
+        }
+    }
+
+    #[test]
+    fn settle_matches_a_long_run_at_the_same_knobs() {
+        for (note, t, m, h) in CASES {
+            let p = params(note, t, m, h);
+            let mut run = WavetableEngine::new();
+            run.init(48_000.0);
+            for _ in 0..4_000 {
+                render(&mut run, &p);
+            }
+            let mut snap = WavetableEngine::new();
+            snap.init(48_000.0);
+            snap.settle(&p);
+            for (a, b) in smoothing(&run).iter().zip(smoothing(&snap).iter()) {
+                assert!((a - b).abs() < 1e-4, "long run {a} vs settle {b}");
+            }
+        }
+    }
 }

@@ -50,6 +50,12 @@ impl Engine for ModalEngine {
         self.voice.init();
     }
 
+    /// HARMONICS' one-pole is slow (0.01 per block, ~460 blocks to 99%), so
+    /// a note after `init()` would otherwise glide its material from 0.
+    fn settle(&mut self, parameters: &EngineParameters) {
+        self.harmonics_lp = parameters.harmonics;
+    }
+
     #[inline]
     fn render(
         &mut self,
@@ -79,5 +85,35 @@ impl Engine for ModalEngine {
             out,
             aux,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settle_matches_a_long_run_and_holds() {
+        let p = EngineParameters {
+            trigger: TriggerState::High,
+            note: 48.0,
+            timbre: 0.5,
+            morph: 0.5,
+            harmonics: 0.73,
+            accent: 1.0,
+            a0_normalized: 55.0 / 48_000.0,
+        };
+        let (mut out, mut aux) = ([0.0; 24], [0.0; 24]);
+        let mut run = ModalEngine::new(24);
+        run.init(48_000.0);
+        for _ in 0..4_000 {
+            run.render(&p, &mut out, &mut aux, &mut false);
+        }
+        let mut snap = ModalEngine::new(24);
+        snap.init(48_000.0);
+        snap.settle(&p);
+        assert!((run.harmonics_lp - snap.harmonics_lp).abs() < 1e-4);
+        snap.render(&p, &mut out, &mut aux, &mut false);
+        assert_eq!(snap.harmonics_lp, p.harmonics);
     }
 }

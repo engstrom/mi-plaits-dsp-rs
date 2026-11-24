@@ -28,6 +28,17 @@ pub trait Engine: Send + Sync + DynClone {
 
     fn reset(&mut self) {}
 
+    /// Jump every knob-smoothing stage straight to where it would settle for
+    /// `parameters`, so the next `render` starts as if the engine had been
+    /// running at these knobs for a long time.
+    ///
+    /// On the module the engine renders continuously, so the glide out of
+    /// `init()`'s zeroed smoothing state is over before anyone plays. A host
+    /// that renders a voice only while it sounds would otherwise open a note
+    /// on that glide. Constant cost, allocation-free. The default is a no-op
+    /// for engines with no knob smoothing.
+    fn settle(&mut self, _parameters: &EngineParameters) {}
+
     fn render(
         &mut self,
         parameters: &EngineParameters,

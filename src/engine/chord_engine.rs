@@ -90,6 +90,14 @@ impl Engine for ChordEngine<'_> {
         self.chords.reset();
     }
 
+    /// MORPH and TIMBRE pass through 0.1-per-block one-poles. The per-voice
+    /// oscillators' one-block parameter ramps are left as they are: they're
+    /// the voices' own declick, not knob smoothing.
+    fn settle(&mut self, parameters: &EngineParameters) {
+        self.morph_lp = parameters.morph;
+        self.timbre_lp = parameters.timbre;
+    }
+
     #[inline]
     fn render(
         &mut self,
@@ -222,3 +230,35 @@ const REGISTRATIONS: [[f32; CHORD_NUM_HARMONICS * 2]; REGISTRATION_TABLE_SIZE] =
 ];
 
 const FADE_POINT: [f32; CHORD_NUM_VOICES] = [0.55, 0.47, 0.49, 0.51, 0.53];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TriggerState;
+
+    #[test]
+    fn settle_matches_a_long_run_and_holds() {
+        let p = EngineParameters {
+            trigger: TriggerState::High,
+            note: 48.0,
+            timbre: 0.62,
+            morph: 0.81,
+            harmonics: 0.4,
+            accent: 1.0,
+            a0_normalized: 55.0 / 48_000.0,
+        };
+        let (mut out, mut aux) = ([0.0; 24], [0.0; 24]);
+        let mut run = ChordEngine::new();
+        run.init(48_000.0);
+        for _ in 0..1_000 {
+            run.render(&p, &mut out, &mut aux, &mut false);
+        }
+        let mut snap = ChordEngine::new();
+        snap.init(48_000.0);
+        snap.settle(&p);
+        assert!((run.morph_lp - snap.morph_lp).abs() < 1e-4);
+        assert!((run.timbre_lp - snap.timbre_lp).abs() < 1e-4);
+        snap.render(&p, &mut out, &mut aux, &mut false);
+        assert_eq!((snap.morph_lp, snap.timbre_lp), (p.morph, p.timbre));
+    }
+}
