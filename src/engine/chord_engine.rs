@@ -32,6 +32,9 @@ pub struct ChordEngine<'a> {
 
     morph_lp: f32,
     timbre_lp: f32,
+    /// False from `init` until the first `render`, which starts TIMBRE's and MORPH's smoothing
+    /// at the knob rather than smoothing up to them from 0.
+    primed: bool,
 
     wavetable: [&'a [i16]; 15],
 }
@@ -50,6 +53,7 @@ impl Default for ChordEngine<'_> {
             chords: ChordBank::new(),
             morph_lp: 0.0,
             timbre_lp: 0.0,
+            primed: false,
             wavetable: [
                 &WAV_INTEGRATED_WAVES[wt_index(2, 6, 1)..],
                 &WAV_INTEGRATED_WAVES[wt_index(2, 6, 6)..],
@@ -82,6 +86,7 @@ impl Engine for ChordEngine<'_> {
 
         self.morph_lp = 0.0;
         self.timbre_lp = 0.0;
+        self.primed = false;
 
         self.reset();
     }
@@ -98,8 +103,20 @@ impl Engine for ChordEngine<'_> {
         aux: &mut [f32],
         _already_enveloped: &mut bool,
     ) {
-        one_pole(&mut self.morph_lp, parameters.morph, 0.1);
-        one_pole(&mut self.timbre_lp, parameters.timbre, 0.1);
+        // Grout: the first render after `init` starts TIMBRE's and MORPH's smoothing at the
+        // knob. On the module `init` runs once, so the smoothing tracks the knob across notes
+        // and a held knob is already where it points; a host that re-initialises the engine at
+        // every note-on (Grout's `PlaitsVoice::restart`) would otherwise sweep each note's
+        // inversion and waveform up from 0 over ~14 ms at 48 kHz (grout #1201, as #1038 was for
+        // Modal). Later renders smooth as before, so a knob moved during a note still glides.
+        if self.primed {
+            one_pole(&mut self.morph_lp, parameters.morph, 0.1);
+            one_pole(&mut self.timbre_lp, parameters.timbre, 0.1);
+        } else {
+            self.morph_lp = parameters.morph;
+            self.timbre_lp = parameters.timbre;
+            self.primed = true;
+        }
 
         self.chords.set_chord(parameters.harmonics);
 

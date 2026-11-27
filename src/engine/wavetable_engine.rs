@@ -33,6 +33,10 @@ use crate::utils::parameter_interpolator::SimpleParameterInterpolator;
 const TABLE_SIZE: usize = 128;
 const TABLE_SIZE_F: f32 = TABLE_SIZE as f32;
 
+/// The largest `f32` below 7.0: where the first render after `init` starts the per-sample
+/// row, column and bank state when its target is the top of the grid (Grout #1201).
+const BELOW_TOP: f32 = 6.999_999_5;
+
 /// #306 user-bank pool size: 4 independent banks × 64 waves × (`TABLE_SIZE` + 4
 /// Hermite guard) i16. The stock 192-wave pool only has 3 independent banks
 /// (bank D is a permutation), so a distinct 4-bank BLEND needs its own pool.
@@ -54,6 +58,11 @@ pub struct WavetableEngine<'a> {
     previous_y: f32,
     previous_z: f32,
     previous_f0: f32,
+
+    /// False from `init` until the first `render`, which starts the bank and the position in
+    /// it (both the per-chunk smoothing and the per-sample interpolation) at the knobs rather
+    /// than smoothing up to them from wave 0.
+    primed: bool,
 
     diff_out: Differentiator,
 
@@ -90,6 +99,8 @@ impl<'a> WavetableEngine<'a> {
             previous_y: 0.0,
             previous_z: 0.0,
             previous_f0: 0.0,
+
+            primed: false,
 
             diff_out: Differentiator::new(),
 
@@ -172,6 +183,7 @@ impl Engine for WavetableEngine<'_> {
         self.previous_y = 0.0;
         self.previous_z = 0.0;
         self.previous_f0 = 55.0 / _sample_rate_hz; // A0 normalized
+        self.primed = false;
 
         self.diff_out.init();
     }
@@ -186,9 +198,24 @@ impl Engine for WavetableEngine<'_> {
     ) {
         let f0 = note_to_frequency(parameters.note, parameters.a0_normalized);
 
-        one_pole(&mut self.x_pre_lp, parameters.timbre * 6.9999, 0.2);
-        one_pole(&mut self.y_pre_lp, parameters.morph * 6.9999, 0.2);
-        one_pole(&mut self.z_pre_lp, parameters.harmonics * 6.9999, 0.05);
+        // Grout: the first render after `init` starts the smoothing of HARMONICS (the bank),
+        // TIMBRE and MORPH (the row and column in it) at the knobs. On the module `init` runs
+        // once, so the smoothing tracks the knobs across notes and a held knob is already where
+        // it points; a host that re-initialises the engine at every note-on (Grout's
+        // `PlaitsVoice::restart`) would otherwise sweep each note's wave up from wave 0 of bank
+        // A, through the lower banks, over ~30 ms at 48 kHz (grout #1201, as #1038 was for
+        // Modal). Later renders smooth as before, so a knob moved during a note still glides.
+        let primed = self.primed;
+        if primed {
+            one_pole(&mut self.x_pre_lp, parameters.timbre * 6.9999, 0.2);
+            one_pole(&mut self.y_pre_lp, parameters.morph * 6.9999, 0.2);
+            one_pole(&mut self.z_pre_lp, parameters.harmonics * 6.9999, 0.05);
+        } else {
+            self.x_pre_lp = parameters.timbre * 6.9999;
+            self.y_pre_lp = parameters.morph * 6.9999;
+            self.z_pre_lp = parameters.harmonics * 6.9999;
+            self.primed = true;
+        }
 
         let x = self.x_pre_lp;
         let y = self.y_pre_lp;
@@ -207,6 +234,21 @@ impl Engine for WavetableEngine<'_> {
         x_fractional += quantization * (clamp(x_fractional, 16.0) - x_fractional);
         y_fractional += quantization * (clamp(y_fractional, 16.0) - y_fractional);
         z_fractional += quantization * (clamp(z_fractional, 16.0) - z_fractional);
+
+        if !primed {
+            // Grout: the per-sample interpolation starts at this chunk's target too, not at
+            // wave 0, so the first chunk neither ramps nor low-passes up to the knobs. A
+            // quantized bank's target can be exactly 7.0, which the one-pole below only ever
+            // approaches from beneath (its step rounds to nothing a few ulps short), and the
+            // wave read needs integral parts of at most 6; so the low-passed state starts at
+            // the target or `BELOW_TOP`, whichever is lower.
+            self.previous_x = x_integral as f32 + x_fractional;
+            self.previous_y = y_integral as f32 + y_fractional;
+            self.previous_z = z_integral as f32 + z_fractional;
+            self.x_lp = f32::min(self.previous_x, BELOW_TOP);
+            self.y_lp = f32::min(self.previous_y, BELOW_TOP);
+            self.z_lp = f32::min(self.previous_z, BELOW_TOP);
+        }
 
         let x_modulation = SimpleParameterInterpolator::new(
             self.previous_x,
